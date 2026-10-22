@@ -16,6 +16,12 @@ from websearch.injector import Injection, build_injection_text  # noqa: E402
 from websearch.llm_backend import parse_classification          # noqa: E402
 from websearch.tavily_client import format_results              # noqa: E402
 from websearch.config import WebSearchConfig                    # noqa: E402
+from websearch.stt_engine import KyutaiSTT, FRAME_SAMPLES       # noqa: E402
+import numpy as np                                              # noqa: E402
+import queue as _queue                                          # noqa: E402
+import threading as _threading                                  # noqa: E402
+import time as _time                                            # noqa: E402
+from collections import deque as _deque                         # noqa: E402
 
 FAILED = []
 
@@ -106,6 +112,79 @@ os.environ["TAVILY_API_KEY"] = "tvly-env"
 cfg2 = WebSearchConfig.from_args(_args(enable_web_search=True), log=logs.append)
 check("config key from env", cfg2 is not None and cfg2.tavily_api_key == "tvly-env")
 del os.environ["TAVILY_API_KEY"]
+
+
+# ---------------------------------------------------------------- STT turn logic (stubbed model)
+# KyutaiSTT.__init__ loads the real checkpoint, so build a bare instance and stub
+# the model/reset: this exercises the VAD, the pre-roll replay, the echo guard and
+# the empty-turn diagnostics without a GPU.
+def _make_stub_stt():
+    stt = object.__new__(KyutaiSTT)
+    stt.logs = []
+    stt.log = lambda msg: stt.logs.append(str(msg))
+    stt.vad_rms = 0.01
+    stt.vad_speech_ms = 500
+    stt.vad_silence_ms = 500
+    stt.flush_quiet_ms = 500
+    stt.flush_max_ms = 1400
+    stt.min_question_words = 2
+    stt.assistant_rms = 0.006
+    stt.assistant_hold_s = 0.5
+    stt.preroll_frames = 10
+    stt._q = _queue.Queue(maxsize=600)
+    stt._stop = _threading.Event()
+    stt._lock = _threading.Lock()
+    stt._session_active = True
+    stt.on_turn_complete = None
+    stt.on_turn_closing = None
+    stt._preroll = _deque(maxlen=stt.preroll_frames)
+    stt._reset_model_state = lambda: None
+    stt._model_calls = []
+    def _fake_model_frame(frame):
+        stt._model_calls.append(float(np.sqrt(np.mean(np.square(frame)))))
+        return ""
+    stt._model_frame = _fake_model_frame
+    KyutaiSTT._reset_turn_state(stt)
+    return stt
+
+
+def _frame(rms):
+    return np.full(FRAME_SAMPLES, rms, dtype=np.float32)
+
+
+stt = _make_stub_stt()
+for _ in range(3):
+    stt._process_frame(_frame(0.005))          # soft onset frames -> pre-roll
+check("preroll buffers pre-turn frames", len(stt._preroll) == 3)
+stt._process_frame(_frame(0.05))               # loud frame -> turn opens
+check("turn opens on loud frame", stt._in_turn is True)
+check("preroll replayed into model at turn open", len(stt._model_calls) == 4)  # 3 pre + 1 live
+check("preroll cleared after turn open", len(stt._preroll) == 0)
+
+stt = _make_stub_stt()
+stt._assistant_speaking_until = _time.perf_counter() + 10.0   # avatar speaking
+for _ in range(3):
+    stt._process_frame(_frame(0.005))
+check("echo guard keeps pre-roll empty", len(stt._preroll) == 0)
+check("echo guard blocks turn open", stt._in_turn is False)
+
+stt = _make_stub_stt()
+stt._process_frame(_frame(0.05))
+for _ in range(8):
+    stt._process_frame(_frame(0.05))           # speech, but the model emits nothing
+stt._fire_turn(_time.perf_counter())
+check("empty turn logs DIAG", any("DIAG empty turn" in m for m in stt.logs))
+
+stt = _make_stub_stt()
+_pieces = iter([" what", " is", " bitcoin", "?", "", "", "", "", "", "", "", ""])
+stt._model_frame = lambda frame: next(_pieces, "")
+stt._process_frame(_frame(0.05))
+for _ in range(10):
+    stt._process_frame(_frame(0.05))
+_got = []
+stt.on_turn_complete = lambda q, t: _got.append(q)
+stt._fire_turn(_time.perf_counter())
+check("turn assembles question text", bool(_got) and "bitcoin" in _got[0])
 
 print()
 if FAILED:

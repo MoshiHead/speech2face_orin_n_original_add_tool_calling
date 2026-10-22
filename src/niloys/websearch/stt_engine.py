@@ -18,6 +18,7 @@ The loop below reproduces the official LMGen behaviour for dep_q=0 / delays=0 mo
 from __future__ import annotations
 
 import contextlib
+from collections import deque
 import json
 import queue
 import threading
@@ -49,7 +50,7 @@ class KyutaiSTT:
                  vad_rms: float = 0.01, vad_speech_ms: int = 500, vad_silence_ms: int = 500,
                  flush_quiet_ms: int = 500, flush_max_ms: int = 1400,
                  min_question_words: int = 2, assistant_rms: float = 0.006,
-                 assistant_hold_s: float = 0.5, log=print):
+                 assistant_hold_s: float = 0.5, preroll_ms: int = 800, log=print):
         import torch
         import sentencepiece
         from huggingface_hub import hf_hub_download
@@ -65,6 +66,11 @@ class KyutaiSTT:
         self.min_question_words = int(min_question_words)
         self.assistant_rms = float(assistant_rms)
         self.assistant_hold_s = float(assistant_hold_s)
+        # Pre-roll: frames buffered BEFORE the VAD opens a turn, replayed into the
+        # model at turn open so a soft onset ("what is ..." below the RMS threshold)
+        # is not clipped -- without this the first syllables are lost and the STT
+        # mishears (e.g. "what is bitcoin?" -> "parties Bitcoin").
+        self.preroll_frames = max(1, int(round(int(preroll_ms) / (FRAME_SEC * 1000.0))))
 
         cfg_path = hf_hub_download(repo, "config.json")
         with open(cfg_path) as fh:
@@ -119,6 +125,7 @@ class KyutaiSTT:
         self._session_active = False
         self.on_turn_complete = None      # set by the orchestrator: fn(question, turn_end_time)
         self.on_turn_closing = None       # set by the orchestrator: fn(partial_text) at flush start
+        self._preroll: deque = deque(maxlen=self.preroll_frames)
         self._reset_model_state()
         self._reset_turn_state()
 
@@ -161,6 +168,9 @@ class KyutaiSTT:
         self._last_user_speech_at = 0.0
         self._assistant_speaking_until = 0.0
         self._last_mic_rms = 0.0
+        self._turn_model_frames = 0
+        self._turn_text_pieces = 0
+        self._preroll.clear()
 
     def _model_frame(self, frame_f32: np.ndarray) -> str:
         """One 80 ms frame through Mimi + STT LM -> newly emitted text (maybe '')."""
@@ -269,8 +279,29 @@ class KyutaiSTT:
                     self._turn_peak_rms = rms
                     self._silence_run = 0
                     self._flushing = False
+                    self._last_text_at = now   # flush window is per-turn, never stale
+                    self._turn_model_frames = 0
+                    self._turn_text_pieces = 0
+                    # Replay the pre-roll so the onset syllables (spoken before the
+                    # RMS crossed the VAD threshold) reach the model too.
+                    for pre in self._preroll:
+                        try:
+                            pre_piece = self._model_frame(pre)
+                        except Exception:  # noqa: BLE001
+                            pre_piece = ""
+                        self._turn_model_frames += 1
+                        if pre_piece:
+                            self._turn_text += pre_piece
+                            self._turn_text_pieces += 1
+                    self._preroll.clear()
                     self.log(f"[STT] turn open (rms={rms:.4f})")
                 else:
+                    # Not opening a turn: keep a short pre-roll of recent frames for
+                    # the next turn's onset -- but never buffer the avatar's own echo.
+                    if now >= self._assistant_speaking_until:
+                        self._preroll.append(frame.copy())
+                    else:
+                        self._preroll.clear()
                     return
             if speaking:
                 self._silence_run = 0
@@ -283,8 +314,10 @@ class KyutaiSTT:
             except Exception as e:  # noqa: BLE001
                 self.log(f"[STT] model frame failed ({e!r}); skipping frame")
                 piece = ""
+            self._turn_model_frames += 1
             if piece:
                 self._turn_text += piece
+                self._turn_text_pieces += 1
                 self._last_text_at = now
             if (not self._flushing and not speaking
                     and self._silence_run * FRAME_SEC * 1000.0 >= self.vad_silence_ms
@@ -313,6 +346,9 @@ class KyutaiSTT:
     def _fire_turn(self, now: float) -> None:
         question = " ".join(self._turn_text.split())
         peak = self._turn_peak_rms
+        speech_frames = self._turn_speech_frames
+        model_frames = self._turn_model_frames
+        text_pieces = self._turn_text_pieces
         self._in_turn = False
         self._flushing = False
         self._turn_text = ""
@@ -329,6 +365,12 @@ class KyutaiSTT:
         else:
             self.log(f"[STT] turn closed with no transcript (peak_rms={peak:.4f}) -- "
                      f"if this was speech, the STT may not be transcribing")
+            if speech_frames > 0:
+                # Anomalous: real speech energy but the model emitted nothing. Log the
+                # internals so the cause (worker lag, echo, model state) is visible.
+                self.log(f"[STT] DIAG empty turn: speech_frames={speech_frames} "
+                         f"model_frames={model_frames} text_pieces={text_pieces} "
+                         f"peak_rms={peak:.4f} feed_q={self._q.qsize()}")
 
     # ------------------------------------------------------------------ offline (tests)
     def transcribe_offline(self, pcm_f32: np.ndarray) -> str:

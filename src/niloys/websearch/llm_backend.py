@@ -18,8 +18,11 @@ CLASSIFY_SYSTEM = (
     "You route spoken questions. Reply SEARCH only if answering needs current, recent or "
     "external information: news, prices, weather, sports results, releases, events, "
     "company or product facts, or specific facts a small assistant may not know. "
-    "Reply NOSEARCH for casual chat, opinions, math, explanations of well-known concepts, "
-    "or questions about the assistant.\n"
+    "Reply NOSEARCH for casual chat, opinions, math, questions about the assistant, and "
+    "for definitions or explanations of well-known concepts (e.g. 'what is Bitcoin?') -- "
+    "naming a product, asset or company does NOT by itself make a question time-sensitive. "
+    "If the question is a fragment, garbled, or does not clearly ask for current "
+    "information, reply NOSEARCH.\n"
     "Answer with EXACTLY one line: SEARCH or NOSEARCH. "
     "If SEARCH, add a second line with a short web search query."
 )

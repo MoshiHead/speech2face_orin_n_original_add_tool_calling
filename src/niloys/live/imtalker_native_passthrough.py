@@ -2918,6 +2918,20 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 native_audio_seq = 0
                 last_event_alarm_wall = 0.0
 
+                def _drain_persona_input(keep_samples: int = 9600) -> None:
+                    # Drop mic audio that piles up while PersonaPlex is paused for a
+                    # web search (or blocked behind the ~1-2 s injection lock). Replaying
+                    # that stale room tone afterwards burst the persona -> GPU event
+                    # queue (~50 events = ~4 s); and because the video sender races late
+                    # frames immediately while the audio sender paces at 75 ms/packet,
+                    # the avatar's lip-sync then ran ~2-4 s ahead of its voice for the
+                    # rest of the session. Keep only the last ~400 ms so a barge-in
+                    # onset still reaches the model.
+                    with reply_input_lock:
+                        buf = getattr(reply_engine, "input_buffer", None)
+                        if buf is not None and int(buf.shape[0]) > keep_samples:
+                            reply_engine.input_buffer = buf[-keep_samples:]
+
                 while not pipeline_stop_event.is_set():
                     # Web-search injection: runs on THIS thread, under the session lock,
                     # inside the same CUDA stream the LM graphs are replayed on.
@@ -2933,11 +2947,22 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 with reply_input_lock:
                                     _inj.run(reply_engine, websearch.should_abort_injection, websearch.log)
                             websearch.clear_search_gate()   # injection landed -> let the model answer
+                            # The injection held reply_input_lock for ~1-2 s, so mic audio
+                            # piled up in mic_q / input_buffer. Keep draining for a short
+                            # grace window (the blocked ingest thread needs a few ms to
+                            # flush its batch) so the model resumes on FRESH audio and no
+                            # catch-up burst reaches the GPU producer.
+                            drain_until = time.perf_counter() + 0.35
+                            while time.perf_counter() < drain_until:
+                                _drain_persona_input()
+                                time.sleep(0.005)
                             continue
                         if websearch.search_gate_set():
                             # A web search is pending: pause PersonaPlex's input so the
                             # injection lands BEFORE the model starts answering from its
                             # own knowledge (kills the mid-answer cutoff + deflection).
+                            # Drain the mic backlog too, or the pause desyncs A/V.
+                            _drain_persona_input()
                             time.sleep(0.002)
                             continue
                     if not session_started.is_set() or _persona_buffered_samples() < MIMI_FRAME_SIZE:
@@ -3658,6 +3683,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         float(np.sqrt(np.mean(np.square(audio_pcm, dtype=np.float32))))
                         if audio_pcm.size else 0.0
                     )
+                    if websearch is not None:
+                        # Echo guard keyed to PLAYBACK (not just production): while the
+                        # avatar's voice is actually sounding at the client, the STT
+                        # must not open a user turn on the speaker echo. With no media
+                        # backlog this fires at ~production time and is a no-op change.
+                        websearch.observe_reply_rms(packet_rms)
                     if packet_rms >= 0.006:
                         playback_state["active"] = True
                         playback_state["hold"] = 4
