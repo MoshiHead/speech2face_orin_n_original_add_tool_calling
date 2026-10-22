@@ -110,6 +110,7 @@ class KyutaiSTT:
 
         self.mimi.streaming_forever(1)
         self.lm.streaming_forever(1)
+        self._disable_mimi_graphs()
 
         self._q: queue.Queue = queue.Queue(maxsize=600)   # ~48 s of 80 ms frames
         self._stop = threading.Event()
@@ -122,9 +123,27 @@ class KyutaiSTT:
 
 
     # ------------------------------------------------------------------ model
+    def _disable_mimi_graphs(self) -> None:
+        """Force this Mimi instance to run fully eager.
+
+        MimiModel._init_streaming_state wraps the encoder/decoder transformers in
+        CUDAGraphed, which CAPTURES lazily on first use. A capture runs in 'global'
+        error mode, which cannot tolerate the persona/render threads' concurrent CUDA
+        work -- it crashes them ('operation not permitted when stream is capturing',
+        'Offset increment outside graph capture'). The STT is a side thread and does
+        not need the graph speedup, so pin its wrappers to eager. reset_streaming()
+        re-creates the wrappers, so this is re-applied after every reset.
+        """
+        st = getattr(self.mimi, "_streaming_state", None)
+        for attr in ("graphed_tr_enc", "graphed_tr_dec"):
+            g = getattr(st, attr, None) if st is not None else None
+            if g is not None:
+                g.disable = True
+
     def _reset_model_state(self) -> None:
         with contextlib.suppress(Exception):
             self.mimi.reset_streaming()
+        self._disable_mimi_graphs()
         with contextlib.suppress(Exception):
             self.lm.reset_streaming()
         self._prev_input = self.lm._get_initial_token()   # [1, 33, 1]

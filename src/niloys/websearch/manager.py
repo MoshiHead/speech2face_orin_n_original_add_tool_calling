@@ -57,6 +57,15 @@ class WebSearchManager:
             self.orchestrator = WebSearchOrchestrator(self.cfg, self.stt, self.llm, log=self.log)
             self.stt.on_turn_complete = self.orchestrator.on_turn_complete
             self.stt.start()
+            # Warm up the STT on a short silence buffer: any lazy cuDNN/autotune work
+            # happens here in the background thread (not mid-conversation), and it
+            # validates the model before it goes live.
+            try:
+                import numpy as np
+                self.stt.transcribe_offline(np.zeros(24000, dtype=np.float32))
+                self.log("[STT] warmup ok")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[STT] warmup failed ({e!r}) -- will retry on the first turn")
             self.ready = True
             self.log(
                 f"ready in {time.perf_counter() - t0:.1f}s "
