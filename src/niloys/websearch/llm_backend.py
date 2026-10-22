@@ -120,3 +120,35 @@ def parse_classification(text: str, question: str) -> tuple:
         query = query.strip().strip('"').strip() or question
         return True, query
     return False, question
+
+
+# Obvious "needs current information" signals. A self-contained question with one of
+# these is sent to Tavily directly (the keyword fast-path), so a conservative small LLM
+# can never suppress an obvious search. Ambiguous / follow-up questions still go to the
+# LLM classifier (which sees the conversation history).
+SEARCH_KEYWORDS = (
+    "price", "prices", "cost", "today", "today's", "tonight", "news", "latest",
+    "current", "currently", "right now", "weather", "forecast", "stock", "stocks",
+    "market", "markets", "bitcoin", "btc", "ethereum", "crypto", "gold", "silver",
+    "oil", "score", "who won", "election", "release", "released", "update", "updated",
+    "this week", "this year", "this month", "exchange rate", "interest rate",
+    "inflation", "gdp", "earnings", "nba", "nfl", "premier league", "world cup",
+)
+
+_CONTEXT_WORDS = {
+    "it", "its", "this", "that", "they", "them", "their", "he", "she", "his",
+    "her", "those", "these",
+}
+
+
+def keyword_suggests_search(question: str) -> bool:
+    q = f" {question.lower()} "
+    return any(k in q for k in SEARCH_KEYWORDS)
+
+
+def needs_context(question: str) -> bool:
+    """True for pronoun-heavy follow-ups that need conversation history to become a
+    good search query (e.g. 'and what about its price?'). A short but self-contained
+    question ('bitcoin price today') does NOT need context -- length is not the signal."""
+    words = set(question.lower().replace("?", " ").replace(".", " ").replace(",", " ").split())
+    return bool(words & _CONTEXT_WORDS)

@@ -153,6 +153,7 @@ class KyutaiSTT:
         self._flushing = False
         self._turn_text = ""
         self._turn_speech_frames = 0
+        self._turn_peak_rms = 0.0
         self._silence_run = 0
         self._last_text_at = 0.0
         self._flush_start = 0.0
@@ -264,13 +265,16 @@ class KyutaiSTT:
                     self._in_turn = True
                     self._turn_text = ""
                     self._turn_speech_frames = 0
+                    self._turn_peak_rms = rms
                     self._silence_run = 0
                     self._flushing = False
+                    self.log(f"[STT] turn open (rms={rms:.4f})")
                 else:
                     return
             if speaking:
                 self._silence_run = 0
                 self._turn_speech_frames += 1
+                self._turn_peak_rms = max(self._turn_peak_rms, rms)
             else:
                 self._silence_run += 1
             try:
@@ -300,19 +304,23 @@ class KyutaiSTT:
 
     def _fire_turn(self, now: float) -> None:
         question = " ".join(self._turn_text.split())
+        peak = self._turn_peak_rms
         self._in_turn = False
         self._flushing = False
         self._turn_text = ""
         self._turn_speech_frames = 0
         self._silence_run = 0
         if len(question.split()) >= self.min_question_words and self.on_turn_complete is not None:
-            self.log(f"[STT] question: {question!r}")
+            self.log(f"[STT] question: {question!r} (peak_rms={peak:.4f})")
             try:
                 self.on_turn_complete(question, now)
             except Exception as e:  # noqa: BLE001
                 self.log(f"[STT] turn callback failed ({e!r})")
         elif question:
-            self.log(f"[STT] ignoring short utterance: {question!r}")
+            self.log(f"[STT] ignoring short utterance: {question!r} (peak_rms={peak:.4f})")
+        else:
+            self.log(f"[STT] turn closed with no transcript (peak_rms={peak:.4f}) -- "
+                     f"if this was speech, the STT may not be transcribing")
 
     # ------------------------------------------------------------------ offline (tests)
     def transcribe_offline(self, pcm_f32: np.ndarray) -> str:

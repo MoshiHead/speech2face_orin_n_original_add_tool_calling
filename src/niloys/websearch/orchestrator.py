@@ -13,6 +13,7 @@ import time
 
 from .history import TurnHistory
 from .injector import Injection
+from .llm_backend import keyword_suggests_search, needs_context
 from .tavily_client import format_results, tavily_search_async
 
 
@@ -112,14 +113,20 @@ class WebSearchOrchestrator:
         t0 = time.perf_counter()
         try:
             history_text = self.history.as_prompt_text()
-            needs, query = await asyncio.wait_for(
-                self._loop.run_in_executor(None, self.llm.classify, question, history_text),
-                timeout=cfg.llm_timeout_s,
-            )
-            raw = getattr(self.llm, "last_classify_raw", "")
-            self.log(f"[LLM-DECISION] {'SEARCH' if needs else 'NOSEARCH'}"
-                     f" ({1000.0 * (time.perf_counter() - t0):.0f} ms)"
-                     f" q={question!r} raw={raw!r}")
+            if keyword_suggests_search(question) and not needs_context(question):
+                # keyword fast-path: an obvious, self-contained current-info question
+                # goes straight to search (a conservative small LLM cannot suppress it)
+                needs, query = True, question
+                self.log(f"[LLM-DECISION] SEARCH (keyword fast-path) q={question!r}")
+            else:
+                needs, query = await asyncio.wait_for(
+                    self._loop.run_in_executor(None, self.llm.classify, question, history_text),
+                    timeout=cfg.llm_timeout_s,
+                )
+                raw = getattr(self.llm, "last_classify_raw", "")
+                self.log(f"[LLM-DECISION] {'SEARCH' if needs else 'NOSEARCH'}"
+                         f" ({1000.0 * (time.perf_counter() - t0):.0f} ms)"
+                         f" q={question!r} raw={raw!r}")
             if not needs:
                 return
             t1 = time.perf_counter()
