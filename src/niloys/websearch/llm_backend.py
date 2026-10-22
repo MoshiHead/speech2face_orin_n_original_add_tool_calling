@@ -26,8 +26,10 @@ CLASSIFY_SYSTEM = (
 
 ANSWER_SYSTEM = (
     "You answer the user's question using ONLY the web results provided. "
-    "Be concise: at most {max_words} words, plain spoken sentences, no lists, no markdown, "
-    "no URLs. If the results do not answer the question, say you could not find it."
+    "State the single most important fact FIRST (a number, price, or name), in one short "
+    "plain spoken sentence. At most 2 short sentences total, under {max_words} words. "
+    "No lists, no markdown, no URLs, no filler, no 'according to'. "
+    "If the results do not answer the question, say you could not find it."
 )
 
 
@@ -122,17 +124,17 @@ def parse_classification(text: str, question: str) -> tuple:
     return False, question
 
 
-# Obvious "needs current information" signals. A self-contained question with one of
-# these is sent to Tavily directly (the keyword fast-path), so a conservative small LLM
-# can never suppress an obvious search. Ambiguous / follow-up questions still go to the
-# LLM classifier (which sees the conversation history).
+# Obvious "needs CURRENT / changing information" signals. A self-contained question with
+# one of these is sent to Tavily directly (the keyword fast-path), so a conservative small
+# LLM can never suppress an obvious search. Topic nouns (bitcoin, gold, ...) are NOT here
+# on purpose: "what is Bitcoin?" is a static question the model answers from its own
+# knowledge -- only a current-info signal (price, today, news, ...) justifies a search.
+# Ambiguous / follow-up questions still go to the LLM classifier (which sees the history).
 SEARCH_KEYWORDS = (
     "price", "prices", "cost", "today", "today's", "tonight", "news", "latest",
-    "current", "currently", "right now", "weather", "forecast", "stock", "stocks",
-    "market", "markets", "bitcoin", "btc", "ethereum", "crypto", "gold", "silver",
-    "oil", "score", "who won", "election", "release", "released", "update", "updated",
-    "this week", "this year", "this month", "exchange rate", "interest rate",
-    "inflation", "gdp", "earnings", "nba", "nfl", "premier league", "world cup",
+    "current", "currently", "right now", "weather", "forecast", "score", "who won",
+    "election", "release", "released", "update", "updated", "this week", "this year",
+    "this month", "exchange rate", "interest rate", "inflation", "gdp", "earnings",
 )
 
 _CONTEXT_WORDS = {

@@ -118,6 +118,7 @@ class KyutaiSTT:
         self._lock = threading.Lock()
         self._session_active = False
         self.on_turn_complete = None      # set by the orchestrator: fn(question, turn_end_time)
+        self.on_turn_closing = None       # set by the orchestrator: fn(partial_text) at flush start
         self._reset_model_state()
         self._reset_turn_state()
 
@@ -290,6 +291,13 @@ class KyutaiSTT:
                     and self._turn_speech_frames * FRAME_SEC * 1000.0 >= self.vad_speech_ms):
                 self._flushing = True
                 self._flush_start = now
+                # early hook: the turn is closing -- let the orchestrator gate PersonaPlex
+                # BEFORE the model starts answering, using the partial transcript
+                if self.on_turn_closing is not None:
+                    try:
+                        self.on_turn_closing(" ".join(self._turn_text.split()))
+                    except Exception as e:  # noqa: BLE001
+                        self.log(f"[STT] turn-closing callback failed ({e!r})")
             if self._flushing:
                 quiet_ms = (now - self._last_text_at) * 1000.0
                 if quiet_ms >= self.flush_quiet_ms or (now - self._flush_start) * 1000.0 >= self.flush_max_ms:

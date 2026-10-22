@@ -56,6 +56,7 @@ class WebSearchManager:
             self.log(f"[STT] ready: {self.cfg.stt_repo}")
             self.orchestrator = WebSearchOrchestrator(self.cfg, self.stt, self.llm, log=self.log)
             self.stt.on_turn_complete = self.orchestrator.on_turn_complete
+            self.stt.on_turn_closing = self.orchestrator.on_turn_closing
             self.stt.start()
             # Warm up the STT on a short silence buffer: any lazy cuDNN/autotune work
             # happens here in the background thread (not mid-conversation), and it
@@ -102,6 +103,24 @@ class WebSearchManager:
         if self.ready and self.orchestrator is not None:
             return self.orchestrator.should_abort_injection()
         return True
+
+    # ------------------------------------------------------------------ search gate
+    # The gate lives in the orchestrator; while set, the persona thread pauses
+    # PersonaPlex's input so the injection lands BEFORE the model starts answering.
+    def gate_search(self) -> None:
+        if self.ready and self.orchestrator is not None:
+            self.orchestrator.gate_search()
+
+    def clear_search_gate(self) -> None:
+        if self.orchestrator is not None:
+            self.orchestrator.clear_search_gate()
+
+    def search_gate_set(self) -> bool:
+        return (
+            self.ready
+            and self.orchestrator is not None
+            and self.orchestrator.search_gate_set()
+        )
 
     def status(self) -> dict:
         if self.error:

@@ -75,9 +75,9 @@ t = build_injection_text("what is the bitcoin price?", "It is about $100,000 tod
 check("injection wraps in system tags", t.startswith("<" + "|im_start|>system\n") and t.endswith("<" + "|im_end|>\n"))
 check("injection contains question and answer", "bitcoin price?" in t and "$100,000 today" in t)
 
-inj = Injection("q?", " ".join(f"w{i}" for i in range(40)), meta={"budget": 30})
-tokens = inj.fit_token_budget(FakeTok(), 30)
-check("injection fits token budget", len(tokens) <= 30)
+inj = Injection("q?", " ".join(f"w{i}" for i in range(40)), meta={"budget": 60})
+tokens = inj.fit_token_budget(FakeTok(), 60)
+check("injection fits token budget", len(tokens) <= 60)
 check("injection keeps at least 6 answer words", len(inj.answer.split()) >= 6)
 check("injection records token count", inj.meta["tokens"] == len(tokens))
 

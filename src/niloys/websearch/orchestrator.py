@@ -32,6 +32,29 @@ class WebSearchOrchestrator:
         self._pending_user_q: str | None = None
         self._reply_snapshot = ""
         self._session_stop = threading.Event()
+        # While set, the persona thread pauses PersonaPlex's input so the injection
+        # lands BEFORE the model starts answering (kills the mid-answer cutoff and the
+        # "I have no real-time data" deflection). Auto-expires as a failsafe.
+        self.search_gate = threading.Event()
+        self._gate_set_at = 0.0
+        self._gate_timeout_s = 8.0
+
+    # ------------------------------------------------------- search gate
+    def gate_search(self) -> None:
+        self._gate_set_at = time.perf_counter()
+        self.search_gate.set()
+
+    def clear_search_gate(self) -> None:
+        self.search_gate.clear()
+
+    def search_gate_set(self) -> bool:
+        if not self.search_gate.is_set():
+            return False
+        if time.perf_counter() - self._gate_set_at > self._gate_timeout_s:
+            self.log("[INJECT] search gate timed out -- resuming PersonaPlex")
+            self.search_gate.clear()
+            return False
+        return True
 
     # ------------------------------------------------------- session lifecycle
     def on_session_start(self, loop, get_reply_text) -> None:
@@ -49,9 +72,21 @@ class WebSearchOrchestrator:
         self._session_stop.set()
         self._cancel_pending()
         self._drain_injections()
+        self.clear_search_gate()
         self.stt.session_end()
 
     # ------------------------------------------------------- callbacks
+    def on_turn_closing(self, partial_text: str) -> None:
+        """Called from the STT thread the moment the user stops speaking (flush start),
+        ~0.5 s before the full question is ready. If it already looks search-worthy,
+        gate PersonaPlex NOW so the model waits for the injection instead of answering
+        from its own knowledge first."""
+        if self._session_stop.is_set():
+            return
+        if keyword_suggests_search(partial_text) and not needs_context(partial_text):
+            self.gate_search()
+            self.log(f"[STT] gating PersonaPlex (search likely) for: {partial_text!r}")
+
     def on_turn_complete(self, question: str, turn_end_time: float) -> None:
         """Called from the STT thread when a user question is fully transcribed."""
         loop = self._loop
@@ -128,7 +163,10 @@ class WebSearchOrchestrator:
                          f" ({1000.0 * (time.perf_counter() - t0):.0f} ms)"
                          f" q={question!r} raw={raw!r}")
             if not needs:
+                self.clear_search_gate()   # no search coming -> let the model answer now
                 return
+            # a search is coming: make sure PersonaPlex stays gated until the injection
+            self.gate_search()
             t1 = time.perf_counter()
             data = await asyncio.wait_for(
                 tavily_search_async(query, cfg.tavily_api_key, cfg.max_results,
@@ -142,6 +180,7 @@ class WebSearchOrchestrator:
                 self.log(f"[SEARCH]   [{i}] {r.get('title', '')} ({r.get('url', '')})")
                 self.log(f"[SEARCH]       {r.get('content', '')[:180]}")
             if not results:
+                self.clear_search_gate()
                 return
             t2 = time.perf_counter()
             answer = await asyncio.wait_for(
@@ -159,11 +198,13 @@ class WebSearchOrchestrator:
             self.log(f"[LLM-SUMMARY] ({1000.0 * (time.perf_counter() - t2):.0f} ms)"
                      f" answer: {answer!r}")
             if not answer:
+                self.clear_search_gate()
                 return
             late_ms = 1000.0 * (time.perf_counter() - turn_end_time)
             if late_ms > cfg.inject_deadline_ms:
                 self.log(f"[INJECT] answer ready {late_ms:.0f} ms after turn end"
                          f" (> {cfg.inject_deadline_ms} ms deadline) -- NOT injecting")
+                self.clear_search_gate()
                 return
             inj = Injection(question, answer, meta={
                 "budget": cfg.max_inject_tokens,
@@ -178,9 +219,11 @@ class WebSearchOrchestrator:
                 self._schedule_reply_log()
         except asyncio.CancelledError:
             self.log("[SEARCH] superseded by a newer question")
+            self.clear_search_gate()
             raise
         except Exception as e:  # noqa: BLE001
             self.log(f"[SEARCH] pipeline failed ({e!r}) -- continuing without search")
+            self.clear_search_gate()
 
     # ------------------------------------------------------- reply capture
     def _schedule_reply_log(self) -> None:

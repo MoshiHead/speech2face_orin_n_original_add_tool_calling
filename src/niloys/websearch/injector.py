@@ -24,13 +24,17 @@ WRAP_SUFFIX = "<" + "|im_end|>\n"
 
 def build_injection_text(question: str, answer: str) -> str:
     """Same system wrapper as the production persona prompt (liveTry.py), so the
-    model reads the injected text exactly the way it reads its system prompt."""
+    model reads the injected text exactly the way it reads its system prompt. The body
+    tells it to relay the fact directly -- otherwise it tends to deflect to 'I do not
+    have real-time data, check a website'."""
     q = " ".join(str(question or "").split())[:220]
     a = " ".join(str(answer or "").split())
     return (
         WRAP_PREFIX
         + f"Web search result for the user's question \"{q}\": {a}\n"
-        + "Answer the user now using this information."
+        + "You now have this current information. Answer the user directly with these "
+        + "exact facts, naturally, as the answer -- do not say you lack real-time data "
+        + "and do not redirect to a website."
         + WRAP_SUFFIX
     )
 

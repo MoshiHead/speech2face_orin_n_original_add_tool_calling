@@ -2932,6 +2932,13 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             else:
                                 with reply_input_lock:
                                     _inj.run(reply_engine, websearch.should_abort_injection, websearch.log)
+                            websearch.clear_search_gate()   # injection landed -> let the model answer
+                            continue
+                        if websearch.search_gate_set():
+                            # A web search is pending: pause PersonaPlex's input so the
+                            # injection lands BEFORE the model starts answering from its
+                            # own knowledge (kills the mid-answer cutoff + deflection).
+                            time.sleep(0.002)
                             continue
                     if not session_started.is_set() or _persona_buffered_samples() < MIMI_FRAME_SIZE:
                         time.sleep(0.002)
