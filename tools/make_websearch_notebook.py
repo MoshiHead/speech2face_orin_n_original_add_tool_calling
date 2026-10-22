@@ -185,6 +185,11 @@ else:
        cwd=os.path.dirname(REPO_DIR))
 sh("git log -1 --oneline", cwd=REPO_DIR)
 
+# the scripts must be executable: git does not always preserve the execute bit (e.g. when
+# the repo was uploaded from Windows or the GitHub web UI), and ./script.sh then fails with
+# "Permission denied". run_watchdog_x86.sh also calls ./run_x86.sh internally, so fix them all.
+sh("chmod +x *.sh && ls -l *.sh", cwd=REPO_DIR)
+
 # sanity: the web-search package and the x86 scripts must be in the clone
 need = ["src/niloys/websearch", "setup_env_x86.sh", "prepare_x86.sh", "run_x86.sh",
         "tools/test_websearch.py"]
@@ -213,9 +218,9 @@ older copy of this notebook or an older clone — it pulls in `hf_transfer` (whi
 *require* for any Hugging Face download) and upgrades `transformers` for the web-search LLM.""")
 
 code("cell-12", '''sh("./env/bin/python -m pip install -r requirements-x86-extra.txt")
-sh("""./env/bin/python -c 'import sphn, tensorrt, hf_transfer, huggingface_hub, transformers; \\
-   "print("sphn/tensorrt/hf_transfer importable | tensorrt", tensorrt.__version__, \\
-   "| huggingface_hub", huggingface_hub.__version__, "| transformers", transformers.__version__)'""")''')
+sh("""./env/bin/python -c 'import sphn, tensorrt, hf_transfer, huggingface_hub, transformers; """
+   """print("sphn/tensorrt/hf_transfer importable | tensorrt", tensorrt.__version__, """
+   """"| huggingface_hub", huggingface_hub.__version__, "| transformers", transformers.__version__)'""")''')
 
 # =====================================================================================
 md("cell-13", """## 6 · Download the weights and build the TensorRT engine  *(~15–40 min, ~25 GB)*
