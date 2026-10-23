@@ -191,8 +191,9 @@ b("Injection must run <b>on the persona thread, under reply_input_lock, inside t
   "implementation runs it exactly there, between two 80 ms audio steps.")
 b("Cost is one full LM step per token (~10-15 ms on a 4090-class RunPod GPU, ~50-58 ms on Orin "
   "int4). A <=96-token answer is ~0.7-1.2 s on RunPod - injected during the post-question silence, "
-  "so it sounds like a natural 'thinking pause', and A/V sync is preserved because everything "
-  "downstream shifts together.")
+  "so it sounds like a natural 'thinking pause'. A/V sync is preserved because everything "
+  "downstream shifts together - but only once the mic audio that piled up during the pause is "
+  "drained on resume (section 11); the first live test showed the backlog otherwise desyncs A/V.")
 story.append(PageBreak())
 
 # =====================================================================================
@@ -399,8 +400,9 @@ story.append(PageBreak())
 h1("10. Testing and validation performed")
 # =====================================================================================
 b("All 13 new/modified Python files compile (py_compile).")
-b("27/27 pure-logic unit tests pass (tools/test_websearch_units.py): classification parsing, "
-  "Tavily formatting, history, injection text + token budget, config gating.")
+b("35/35 pure-logic unit tests pass (tools/test_websearch_units.py): classification parsing, "
+  "Tavily formatting, history, injection text + token budget, config gating, and the STT turn "
+  "logic (pre-roll replay, echo guard, empty-turn diagnostics) on a stubbed model.")
 b("The websearch package imports cleanly without torch installed (the server imports it at "
   "module level).")
 b("Notebook JSON valid (45 cells); the embedded requirements-x86-extra.txt / prepare_x86.sh / "
@@ -410,7 +412,81 @@ b("On the pod: tools/test_websearch.py --stt / --classify / --search / --e2e giv
   "tools/test_session.py is untouched as the regression gate.")
 
 # =====================================================================================
-h1("11. Known limitations")
+h1("11. v2 runtime fixes (from the live RunPod logs)")
+# =====================================================================================
+p("The first live test (log/websearch_v2.log + log/run_v2.log) exposed five issues the design "
+  "review had not. Each is listed with the stage it pointed to and the fix that shipped:")
+table([
+    ["Symptom (from the logs)", "Root cause", "Fix"],
+    ["'what is bitcoin?' transcribed as 'parties Bitcoin', then searched",
+     "The VAD opens a turn only once RMS >= 0.01, so the soft onset was dropped before the turn "
+     "opened; the classifier then saw a fragment and guessed SEARCH",
+     "800 ms pre-roll ring buffer replayed into the STT at turn open; classifier prompt now "
+     "NOSEARCHes definitions and fragments"],
+    ["answer starts, then stops after 2-3 s; choppy audio",
+     "the gate (~3 s) + the injection lock (~1.6 s) let mic audio pile up; the persona thread "
+     "then replayed ~4-5 s of stale room tone at ~3.3x, bursting ~50 events into the GPU producer",
+     "drain the mic backlog while gated and for 350 ms after each injection (keep the last "
+     "400 ms so a barge-in onset still reaches the model)"],
+    ["avatar lip-syncs 2-3 s BEFORE the voice (video leads audio)",
+     "the ~4 s event backlog: the video sender races late frames immediately while the audio "
+     "sender paces at 75 ms/packet (max 1.067x), so audio lagged video for the rest of the "
+     "session (log: max_late=3965 ms, EVENT-BACKLOG depth=51)",
+     "same drain fix - no backlog forms, so neither stream falls behind"],
+    ["the next 2 questions after a search produced no transcript and were skipped",
+     "the 4 s audio backlog drained at 0.067x, so the avatar's answer was still audibly playing "
+     "when the user spoke again; the echo guard was keyed to production time (already finished) "
+     "and did not protect the STT from the playback echo",
+     "drain fix removes the delay; echo guard now also fed at audio SEND time (playback-"
+     "accurate); [STT] DIAG empty turn logging added"],
+], [50, 62, 58])
+p("The unifying root cause of the last three was the mic backlog that formed whenever "
+  "PersonaPlex was paused: replaying it afterwards burst the persona -> GPU event queue, and "
+  "because the two senders recover at different rates, one stall desynced A/V for the rest of "
+  "the session. Draining the backlog at the source removes the burst entirely, so the answer is "
+  "generated and played at near-real-time and the avatar's playback finishes before the user "
+  "responds.")
+b("All changes are additive and guarded (websearch is not None / gate state): with the feature "
+  "off, or on any failure, the classic pipeline is byte-identical.")
+b("The ~4-5 s frozen-avatar 'thinking pause' during a search is unchanged and by design - the "
+  "fixes target what happens after the pause, not the pause itself.")
+story.append(PageBreak())
+
+# =====================================================================================
+h1("12. v3 runtime fixes (search routing + the greeting bug)")
+# =====================================================================================
+p("The second live test (log/websearch_v3.log) was more revealing: the STT pre-roll worked "
+  "('What is Bitcoin?' transcribed perfectly), but three deeper problems surfaced.")
+table([
+    ["Symptom (from the logs)", "Root cause", "Fix"],
+    ["'What is Bitcoin?' triggered a web search (raw='SEARCH')",
+     "Qwen2.5-1.5B does not follow routing INSTRUCTIONS reliably; the v2 prompt tweak was "
+     "not enough",
+     "deterministic stable-question guard (definition/explanation/opinion openers with no "
+     "current-info keyword -> NOSEARCH) + a few-shot classifier for the ambiguous remainder"],
+    ["4 questions in one message -> 4 searches",
+     "the whole utterance was routed as ONE question",
+     "split_questions() splits on '?'; each sub-question is routed independently; only the "
+     "current-information ones are searched; one combined injection answers all in order"],
+    ["every answer became 'Hey, let me know if you have any other questions.'",
+     "two compounding causes: (1) the injection stated the answer as a finished sentence in "
+     "the model's own speech stream, so it believed it had ALREADY spoken and closed the "
+     "turn; (2) the injection replayed the session-start [text][PAD silence] pattern that "
+     "is always followed by the greeting",
+     "injection reframed to 'the user is waiting - tell them now, out loud'; the answer LLM "
+     "is forbidden from writing label prefixes ('The most important fact is:'); the "
+     "post-injection _step_audio_silence() was removed; and the classifier fix means "
+     "knowledge questions are never injected at all"],
+], [50, 62, 58])
+b("The classifier change is the primary fix: 'What is Bitcoin?' and 'Is it safe to invest "
+  "in Bitcoin?' are now NOSEARCH, so the model answers them directly from its own knowledge "
+  "(no injection, no greeting). Only genuine current-information questions are searched.")
+b("The injection changes target the remaining searched-question greeting; the model's relay "
+  "of those should be re-verified on the pod (watch [REPLY] in websearch.log).")
+story.append(PageBreak())
+
+# =====================================================================================
+h1("13. Known limitations")
 # =====================================================================================
 b("Orin: the STT shares the GPU with the 80 ms step budget while the user speaks - use "
   "WEBSEARCH_STT_INT4=1; the feature is primarily tuned for the RunPod x86 path.")
@@ -425,7 +501,7 @@ b("Tavily's free tier is rate-limited; classification defaults to NOSEARCH on an
   "spurious searches are rare.")
 
 # =====================================================================================
-h1("12. How to use it")
+h1("14. How to use it")
 # =====================================================================================
 code(
     "# one time (RunPod notebook or shell)\n"

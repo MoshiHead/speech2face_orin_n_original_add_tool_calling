@@ -22,41 +22,77 @@ WRAP_PREFIX = "<" + "|im_start|>system\n"
 WRAP_SUFFIX = "<" + "|im_end|>\n"
 
 
-def build_injection_text(question: str, answer: str) -> str:
-    """Same system wrapper as the production persona prompt (liveTry.py), so the
-    model reads the injected text exactly the way it reads its system prompt. The body
-    tells it to relay the fact directly -- otherwise it tends to deflect to 'I do not
-    have real-time data, check a website'."""
-    q = " ".join(str(question or "").split())[:220]
-    a = " ".join(str(answer or "").split())
-    return (
-        WRAP_PREFIX
-        + f"Web search result for the user's question \"{q}\": {a}\n"
-        + "You now have this current information. Answer the user directly with these "
-        + "exact facts, naturally, as the answer -- do not say you lack real-time data "
-        + "and do not redirect to a website."
-        + WRAP_SUFFIX
-    )
+def build_injection_text(questions, facts) -> str:
+    """Build the mid-session conditioning text (same system wrapper as the production
+    persona prompt in liveTry.py, so the model reads it as system text).
+
+    Framing matters: PersonaPlex reads its agent-text stream as its own speech, so an
+    injection that states the answer as a finished sentence makes the model believe it
+    ALREADY spoke it -- and it then just closes the turn ('let me know if you have any
+    other questions') while the user heard silence. So the text always says the user is
+    still WAITING and the answer must be spoken OUT LOUD right now.
+
+    Accepts either (question: str, answer: str) or (questions: list, facts: list).
+    """
+    if isinstance(questions, str):
+        questions = [questions]
+        facts = [(questions[0], facts)] if isinstance(facts, str) else list(facts or [])
+    questions = [" ".join(str(q).split())[:160] for q in questions if str(q).strip()]
+    facts = [(" ".join(str(q).split())[:160], " ".join(str(a).split())) for q, a in (facts or [])]
+    if len(questions) <= 1:
+        q = questions[0] if questions else ""
+        a = facts[0][1] if facts else ""
+        body = (
+            f'The user asked you: "{q}" and is waiting for the answer. '
+            f"Tell them now, out loud, using this information: {a} "
+            "Answer directly in your own words; do not just offer to help."
+        )
+    else:
+        lines = [
+            f"The user asked you {len(questions)} questions and is waiting. "
+            "Answer every one of them, out loud, in order:"
+        ]
+        lines += [f"{i}) {q}" for i, q in enumerate(questions, 1)]
+        if facts:
+            lines.append("Use this information for the current-information ones:")
+            lines += [f'- "{q}": {a}' for q, a in facts]
+        lines.append("Now answer all the questions, one by one, in your own words.")
+        body = "\n".join(lines)
+    return WRAP_PREFIX + body + WRAP_SUFFIX
 
 
 class Injection:
-    """One pending web-answer injection, executed by the persona thread."""
+    """One pending web-answer injection, executed by the persona thread.
 
-    def __init__(self, question: str, answer: str, meta: dict | None = None):
-        self.question = question
-        self.answer = answer
-        self.text = build_injection_text(question, answer)
+    Holds the user's question(s) and the looked-up fact(s) so the wrapped text can be
+    rebuilt if it has to be trimmed to the token budget. Accepts either
+    (question: str, answer: str) or (questions: list, facts: list[(q, answer)]).
+    """
+
+    def __init__(self, questions, facts, meta: dict | None = None):
+        if isinstance(questions, str):
+            questions = [questions]
+            facts = [(questions[0], facts)] if isinstance(facts, str) else list(facts or [])
+        self.questions = [str(q) for q in (questions or [])]
+        self.facts = [(str(q), str(a)) for q, a in (facts or [])]
+        self.question = self.questions[0] if self.questions else ""
+        self.answer = self.facts[0][1] if self.facts else ""
+        self.text = build_injection_text(self.questions, self.facts)
         self.meta = dict(meta or {})
 
     def fit_token_budget(self, tokenizer, budget: int) -> list:
-        """Trim the answer (word boundary) until the wrapped text fits the token budget."""
+        """Trim the longest answer (word boundary) until the wrapped text fits the budget."""
         tokens = list(tokenizer.encode(self.text))
-        words = self.answer.split()
-        while len(tokens) > budget and len(words) > 6:
+        while len(tokens) > budget and self.facts:
+            idx = max(range(len(self.facts)), key=lambda k: len(self.facts[k][1].split()))
+            words = self.facts[idx][1].split()
+            if len(words) <= 6:
+                break
             words = words[: max(6, int(len(words) * 0.8))]
-            self.answer = " ".join(words).rstrip(",;") + "."
-            self.text = build_injection_text(self.question, self.answer)
+            self.facts[idx] = (self.facts[idx][0], " ".join(words).rstrip(",;") + ".")
+            self.text = build_injection_text(self.questions, self.facts)
             tokens = list(tokenizer.encode(self.text))
+        self.answer = self.facts[0][1] if self.facts else ""
         self.meta["tokens"] = len(tokens)
         return tokens
 
@@ -82,8 +118,12 @@ class Injection:
                         input_tokens=lm_gen._encode_sine_frame(),
                     )
                     fed += 1
-                if fed and not (should_abort is not None and should_abort()):
-                    lm_gen._step_audio_silence()
+                # NOTE: deliberately NO lm_gen._step_audio_silence() here. At session
+                # start the sequence [text prompt][PAD silence] is always immediately
+                # followed by the model's greeting, so replaying that exact pattern after
+                # a mid-session injection trained the model to greet/close the turn
+                # instead of answering. Resuming normal sampling right after the tokens
+                # keeps it in "answer mode".
             finally:
                 lm_gen.text_prompt_tokens = None
         except Exception as e:  # noqa: BLE001

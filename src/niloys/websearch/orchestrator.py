@@ -13,7 +13,7 @@ import time
 
 from .history import TurnHistory
 from .injector import Injection
-from .llm_backend import keyword_suggests_search, needs_context
+from .llm_backend import is_stable_question, keyword_suggests_search, needs_context, split_questions
 from .tavily_client import format_results, tavily_search_async
 
 
@@ -148,56 +148,28 @@ class WebSearchOrchestrator:
         t0 = time.perf_counter()
         try:
             history_text = self.history.as_prompt_text()
-            if keyword_suggests_search(question) and not needs_context(question):
-                # keyword fast-path: an obvious, self-contained current-info question
-                # goes straight to search (a conservative small LLM cannot suppress it)
-                needs, query = True, question
-                self.log(f"[LLM-DECISION] SEARCH (keyword fast-path) q={question!r}")
-            else:
-                needs, query = await asyncio.wait_for(
-                    self._loop.run_in_executor(None, self.llm.classify, question, history_text),
-                    timeout=cfg.llm_timeout_s,
-                )
-                raw = getattr(self.llm, "last_classify_raw", "")
-                self.log(f"[LLM-DECISION] {'SEARCH' if needs else 'NOSEARCH'}"
-                         f" ({1000.0 * (time.perf_counter() - t0):.0f} ms)"
-                         f" q={question!r} raw={raw!r}")
-            if not needs:
-                self.clear_search_gate()   # no search coming -> let the model answer now
+            # The user may ask several questions in one utterance: split them and route
+            # each one independently, so stable-knowledge questions are answered directly
+            # and only the current-information ones trigger a search.
+            questions = split_questions(question)
+            searches: list[tuple[str, str]] = []   # (sub_question, query)
+            preceding: list[str] = []
+            for sub_q in questions:
+                needs, query = await self._classify_one(sub_q, history_text, preceding, t0)
+                preceding.append(sub_q)
+                if needs:
+                    searches.append((sub_q, query))
+            if not searches:
+                self.clear_search_gate()   # every question is answerable directly
                 return
-            # a search is coming: make sure PersonaPlex stays gated until the injection
+            # at least one search is coming: keep PersonaPlex gated until the injection
             self.gate_search()
-            t1 = time.perf_counter()
-            data = await asyncio.wait_for(
-                tavily_search_async(query, cfg.tavily_api_key, cfg.max_results,
-                                    cfg.search_timeout_s, cfg.tavily_include_answer),
-                timeout=cfg.search_timeout_s + 1.0,
-            )
-            results = format_results(data, cfg.max_results)
-            self.log(f"[SEARCH] {len(results)} results"
-                     f" ({1000.0 * (time.perf_counter() - t1):.0f} ms) query={query!r}")
-            for i, r in enumerate(results, 1):
-                self.log(f"[SEARCH]   [{i}] {r.get('title', '')} ({r.get('url', '')})")
-                self.log(f"[SEARCH]       {r.get('content', '')[:180]}")
-            if not results:
-                self.clear_search_gate()
-                return
-            t2 = time.perf_counter()
-            answer = await asyncio.wait_for(
-                self._loop.run_in_executor(None, self.llm.synthesize, question, results,
-                                           history_text, cfg.max_answer_words),
-                timeout=cfg.llm_timeout_s,
-            )
-            if not answer:
-                # one retry with a bare prompt (no history) before giving up
-                answer = await asyncio.wait_for(
-                    self._loop.run_in_executor(None, self.llm.synthesize, question, results,
-                                               "", cfg.max_answer_words),
-                    timeout=cfg.llm_timeout_s,
-                )
-            self.log(f"[LLM-SUMMARY] ({1000.0 * (time.perf_counter() - t2):.0f} ms)"
-                     f" answer: {answer!r}")
-            if not answer:
+            facts: list[tuple[str, str]] = []   # (sub_question, answer)
+            for sub_q, query in searches:
+                answer = await self._search_and_summarize(sub_q, query, history_text)
+                if answer:
+                    facts.append((sub_q, answer))
+            if not facts:
                 self.clear_search_gate()
                 return
             late_ms = 1000.0 * (time.perf_counter() - turn_end_time)
@@ -206,9 +178,8 @@ class WebSearchOrchestrator:
                          f" (> {cfg.inject_deadline_ms} ms deadline) -- NOT injecting")
                 self.clear_search_gate()
                 return
-            inj = Injection(question, answer, meta={
+            inj = Injection(questions, facts, meta={
                 "budget": cfg.max_inject_tokens,
-                "query": query,
                 "pipeline_ms": 1000.0 * (time.perf_counter() - t0),
             })
             if cfg.dry_run:
@@ -224,6 +195,64 @@ class WebSearchOrchestrator:
         except Exception as e:  # noqa: BLE001
             self.log(f"[SEARCH] pipeline failed ({e!r}) -- continuing without search")
             self.clear_search_gate()
+
+    async def _classify_one(self, question: str, history_text: str,
+                            preceding: list, t0: float) -> tuple:
+        """Route ONE question: keyword fast-path -> stable-question guard -> LLM (few-shot)."""
+        if keyword_suggests_search(question) and not needs_context(question):
+            self.log(f"[LLM-DECISION] SEARCH (keyword fast-path) q={question!r}")
+            return True, question
+        if is_stable_question(question):
+            self.log(f"[LLM-DECISION] NOSEARCH (stable question) q={question!r}")
+            return False, question
+        ctx = history_text
+        if preceding:
+            ctx = (ctx + "\n" if ctx else "") + "The user just asked: " + " ".join(preceding)
+        try:
+            needs, query = await asyncio.wait_for(
+                self._loop.run_in_executor(None, self.llm.classify, question, ctx),
+                timeout=self.cfg.llm_timeout_s,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[LLM-DECISION] NOSEARCH (classifier error {e!r}) q={question!r}")
+            return False, question
+        raw = getattr(self.llm, "last_classify_raw", "")
+        self.log(f"[LLM-DECISION] {'SEARCH' if needs else 'NOSEARCH'}"
+                 f" ({1000.0 * (time.perf_counter() - t0):.0f} ms) q={question!r} raw={raw!r}")
+        return needs, query
+
+    async def _search_and_summarize(self, question: str, query: str, history_text: str) -> str:
+        cfg = self.cfg
+        t1 = time.perf_counter()
+        data = await asyncio.wait_for(
+            tavily_search_async(query, cfg.tavily_api_key, cfg.max_results,
+                                cfg.search_timeout_s, cfg.tavily_include_answer),
+            timeout=cfg.search_timeout_s + 1.0,
+        )
+        results = format_results(data, cfg.max_results)
+        self.log(f"[SEARCH] {len(results)} results"
+                 f" ({1000.0 * (time.perf_counter() - t1):.0f} ms) query={query!r}")
+        for i, r in enumerate(results, 1):
+            self.log(f"[SEARCH]   [{i}] {r.get('title', '')} ({r.get('url', '')})")
+            self.log(f"[SEARCH]       {r.get('content', '')[:180]}")
+        if not results:
+            return ""
+        t2 = time.perf_counter()
+        answer = await asyncio.wait_for(
+            self._loop.run_in_executor(None, self.llm.synthesize, question, results,
+                                       history_text, cfg.max_answer_words),
+            timeout=cfg.llm_timeout_s,
+        )
+        if not answer:
+            # one retry with a bare prompt (no history) before giving up
+            answer = await asyncio.wait_for(
+                self._loop.run_in_executor(None, self.llm.synthesize, question, results,
+                                               "", cfg.max_answer_words),
+                timeout=cfg.llm_timeout_s,
+            )
+        self.log(f"[LLM-SUMMARY] ({1000.0 * (time.perf_counter() - t2):.0f} ms)"
+                 f" answer: {answer!r}")
+        return answer or ""
 
     # ------------------------------------------------------- reply capture
     def _schedule_reply_log(self) -> None:

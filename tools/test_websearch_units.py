@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.join(ROOT, "src", "niloys"))
 
 from websearch.history import TurnHistory                      # noqa: E402
 from websearch.injector import Injection, build_injection_text  # noqa: E402
-from websearch.llm_backend import parse_classification          # noqa: E402
+from websearch.llm_backend import (parse_classification, is_stable_question, split_questions,  # noqa: E402
+                                   keyword_suggests_search, needs_context)  # noqa: E402
 from websearch.tavily_client import format_results              # noqa: E402
 from websearch.config import WebSearchConfig                    # noqa: E402
 from websearch.stt_engine import KyutaiSTT, FRAME_SAMPLES       # noqa: E402
@@ -86,6 +87,58 @@ tokens = inj.fit_token_budget(FakeTok(), 60)
 check("injection fits token budget", len(tokens) <= 60)
 check("injection keeps at least 6 answer words", len(inj.answer.split()) >= 6)
 check("injection records token count", inj.meta["tokens"] == len(tokens))
+
+# single injection framing: the user is waiting + speak out loud (anti-greeting)
+st = build_injection_text("What is Bitcoin?", "Bitcoin is a decentralized digital currency.")
+check("injection says the user is waiting", "waiting" in st.lower())
+check("injection says answer out loud", "out loud" in st.lower())
+
+# ---------------------------------------------------------------- multi-question injection
+mt = build_injection_text(
+    ["What is Bitcoin?", "What is its price today?"],
+    [("What is its price today?", "It is about $100,000 today.")])
+check("multi injection lists all questions", "1) What is Bitcoin?" in mt and "2) What is its price today?" in mt)
+check("multi injection has the fact", "$100,000 today" in mt)
+check("multi injection wraps in system tags", mt.startswith("<" + "|im_start|>system\n"))
+
+# ---------------------------------------------------------------- stable-question guard
+check("stable: what is X", is_stable_question("What is Bitcoin?"))
+check("stable: explain", is_stable_question("Explain how a blockchain works."))
+check("stable: opinion", is_stable_question("Is it safe to invest in Bitcoin?"))
+check("stable: how does", is_stable_question("How does bitcoin mining work?"))
+check("stable: who is", is_stable_question("Who is Satoshi Nakamoto?"))
+check("not stable: price", not is_stable_question("What is the price of Bitcoin?"))
+check("not stable: today", not is_stable_question("What is the weather today?"))
+check("not stable: news", not is_stable_question("What is the latest news?"))
+check("not stable: current", not is_stable_question("What is the current gold rate?"))
+check("not stable: empty", not is_stable_question(""))
+
+# ---------------------------------------------------------------- split questions
+check("split single", split_questions("What is Bitcoin?") == ["What is Bitcoin?"])
+check("split no question mark", split_questions("tell me about bitcoin") == ["tell me about bitcoin"])
+check("split four", split_questions("What is Bitcoin? What is its price? Is it safe? What is gold today?")
+      == ["What is Bitcoin?", "What is its price?", "Is it safe?", "What is gold today?"])
+check("split empty", split_questions("") == [])
+
+
+# ---------------------------------------------------------------- end-to-end routing decision
+def _route(q):
+    """Mirrors _classify_one's deterministic path: keyword fast-path -> stable guard.
+    Returns True=SEARCH, False=NOSEARCH, None=would fall through to the LLM."""
+    if keyword_suggests_search(q) and not needs_context(q):
+        return True
+    if is_stable_question(q):
+        return False
+    return None
+
+
+check("route: what is bitcoin -> NOSEARCH", _route("What is Bitcoin?") is False)
+check("route: current price of bitcoin -> SEARCH", _route("What is the current price of Bitcoin?") is True)
+check("route: is it safe to invest -> NOSEARCH", _route("Is it safe to invest in Bitcoin?") is False)
+check("route: gold price today -> SEARCH", _route("What is the gold price today?") is True)
+check("route: how does mining work -> NOSEARCH", _route("How does bitcoin mining work?") is False)
+check("route: explain blockchain -> NOSEARCH", _route("Explain how a blockchain works.") is False)
+check("route: latest news -> SEARCH", _route("What is the latest news?") is True)
 
 # ---------------------------------------------------------------- config from args
 def _args(**kw):

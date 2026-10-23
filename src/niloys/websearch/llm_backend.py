@@ -16,23 +16,37 @@ import threading
 
 CLASSIFY_SYSTEM = (
     "You route spoken questions. Reply SEARCH only if answering needs current, recent or "
-    "external information: news, prices, weather, sports results, releases, events, "
-    "company or product facts, or specific facts a small assistant may not know. "
-    "Reply NOSEARCH for casual chat, opinions, math, questions about the assistant, and "
-    "for definitions or explanations of well-known concepts (e.g. 'what is Bitcoin?') -- "
-    "naming a product, asset or company does NOT by itself make a question time-sensitive. "
-    "If the question is a fragment, garbled, or does not clearly ask for current "
-    "information, reply NOSEARCH.\n"
+    "changing information (news, prices, weather, scores, releases, events, rates). "
+    "Reply NOSEARCH for everything else: definitions, explanations, opinions, math, "
+    "how-to, casual chat, and stable general knowledge -- naming a product, asset or "
+    "company does NOT by itself make a question time-sensitive.\n"
     "Answer with EXACTLY one line: SEARCH or NOSEARCH. "
     "If SEARCH, add a second line with a short web search query."
 )
 
+# Few-shot routing examples (generic, not user questions): a small model classifies far
+# more reliably from examples than from instructions alone.
+CLASSIFY_FEWSHOT = (
+    ("What is photosynthesis?", "NOSEARCH"),
+    ("Explain how compound interest works.", "NOSEARCH"),
+    ("Is it safe to invest in stocks?", "NOSEARCH"),
+    ("How do I change a car tire?", "NOSEARCH"),
+    ("What is the capital of France?", "NOSEARCH"),
+    ("What is the price of gold today?", "SEARCH\ngold price today per ounce"),
+    ("Who won the match last night?", "SEARCH\nlatest match result"),
+    ("What's the weather right now?", "SEARCH\nweather now"),
+    ("What is the latest tech news?", "SEARCH\nlatest technology news"),
+    ("What is the current exchange rate for the euro?", "SEARCH\neuro exchange rate today"),
+)
+
 ANSWER_SYSTEM = (
     "You answer the user's question using ONLY the web results provided. "
-    "State the single most important fact FIRST (a number, price, or name), in one short "
-    "plain spoken sentence. At most 2 short sentences total, under {max_words} words. "
-    "No lists, no markdown, no URLs, no filler, no 'according to'. "
-    "If the results do not answer the question, say you could not find it."
+    "Reply with the answer itself, exactly as you would say it out loud: one or two short, "
+    "plain spoken sentences, under {max_words} words, with the most important fact (a "
+    "number, price or name) first. Do NOT add any label or prefix such as 'The most "
+    "important fact is:' or 'The answer is:' -- just state the fact. No lists, no markdown, "
+    "no URLs, no filler, no 'according to'. If the results do not answer the question, say "
+    "you could not find it."
 )
 
 
@@ -76,14 +90,13 @@ class LocalLLM:
         if history_text:
             user += f"Conversation so far:\n{history_text}\n\n"
         user += f"User's question: {question}"
+        messages = [{"role": "system", "content": CLASSIFY_SYSTEM}]
+        for ex_q, ex_a in CLASSIFY_FEWSHOT:
+            messages.append({"role": "user", "content": f"User's question: {ex_q}"})
+            messages.append({"role": "assistant", "content": ex_a})
+        messages.append({"role": "user", "content": user})
         try:
-            text = self.generate(
-                [
-                    {"role": "system", "content": CLASSIFY_SYSTEM},
-                    {"role": "user", "content": user},
-                ],
-                max_new_tokens=24,
-            )
+            text = self.generate(messages, max_new_tokens=24)
         except Exception as e:  # noqa: BLE001
             self.log(f"[LLM] classifier failed ({e!r}) -> NOSEARCH")
             self.last_classify_raw = ""
@@ -157,3 +170,40 @@ def needs_context(question: str) -> bool:
     question ('bitcoin price today') does NOT need context -- length is not the signal."""
     words = set(question.lower().replace("?", " ").replace(".", " ").replace(",", " ").split())
     return bool(words & _CONTEXT_WORDS)
+
+
+# Stable-knowledge question openers (definition / explanation / opinion / how-to). A
+# question that starts like this AND carries no current-info keyword is answered from the
+# model's own knowledge (NOSEARCH) without ever calling the classifier -- this is the
+# deterministic guard that stops "What is Bitcoin?" from triggering a web search.
+_STABLE_STARTERS = (
+    "what is", "what are", "what's", "whats", "who is", "who are", "who was", "who were",
+    "what does", "what do", "what was", "what were", "explain", "define", "describe",
+    "tell me about", "how does", "how do", "how is", "how are", "why is", "why are",
+    "why does", "why do", "is it", "are they", "can you", "could you", "should i",
+    "do you", "what kind", "how to",
+)
+
+
+def is_stable_question(question: str) -> bool:
+    """True for definition / explanation / opinion / how-to questions with no current-info
+    signal -- answered directly from the model's knowledge (NOSEARCH)."""
+    q = " ".join(str(question or "").lower().split())
+    if not q:
+        return False
+    if keyword_suggests_search(q):
+        return False   # a current-info signal always wins ("what is the price of bitcoin?")
+    return any(q.startswith(s) for s in _STABLE_STARTERS)
+
+
+def split_questions(text: str) -> list:
+    """Split a transcribed utterance into individual questions (the user sometimes asks
+    several in one message). Splits after each '?', keeping it; falls back to the whole
+    string when there is no '?'."""
+    import re
+    text = " ".join(str(text or "").split())
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=\?)\s+", text)]
+    parts = [p for p in parts if p]
+    return parts if parts else [text]

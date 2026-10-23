@@ -32,7 +32,7 @@ class WebSearchConfig:
     stt_int4: bool = False
     history_turns: int = 4
     max_inject_tokens: int = 96
-    max_answer_words: int = 60
+    max_answer_words: int = 40
     dry_run: bool = False
     vad_rms: float = 0.01
     vad_speech_ms: int = 500
