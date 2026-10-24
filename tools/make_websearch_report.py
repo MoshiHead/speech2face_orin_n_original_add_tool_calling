@@ -486,7 +486,38 @@ b("The injection changes target the remaining searched-question greeting; the mo
 story.append(PageBreak())
 
 # =====================================================================================
-h1("13. Known limitations")
+h1("13. v4 runtime fix: forced speech (the greeting bug, for real)")
+# =====================================================================================
+p("The third live test (log/websearch_v4.log) proved the v3 injection reframing was still "
+  "not enough: every searched answer came back as the session-start greeting "
+  "('Hello, this is RB Labs. How can I help you today?'). The stable-question guard worked "
+  "('What is Bitcoin?' was answered from knowledge), but the text-prompt injection itself "
+  "was fundamentally broken.")
+table([
+    ["Finding (from the logs + the moshi source)", "Consequence"],
+    ["every [REPLY] was '<0x0A> Hello, this is RB Labs. How can I help you today?' -- the "
+     "exact session-start greeting, newline token and all",
+     "the im_start system block reproduces the session-start token sequence, so the model "
+     "treats it as a NEW session and greets -- no prompt wording can prevent that"],
+    ["LMGen.step() can FORCE the agent-text token while leaving the agent-audio codebooks "
+     "unprovided (moshi_tokens=None); the depformer then generates the matching audio "
+     "(prepare_step_input / process_transformer_output in lm.py)",
+     "the model can be made to SPEAK an exact text in its own voice through the normal "
+     "audio path -- no system prompt, no reset, no greeting"],
+], [85, 85])
+p("The fix: forced speech. The answer LLM writes the exact spoken answer; the injector "
+  "queues its tokens on the reply engine; the persona thread forces each token as the "
+  "agent-text token while the depformer generates the audio, producing normal avatar "
+  "events. The model literally says the answer. Barge-in still aborts it, and the mic "
+  "buffer is drained as it speaks so A/V stays in sync.")
+b("This is reliable by construction: it does not depend on the model choosing to relay an "
+  "injected hint -- it speaks the answer verbatim. Knowledge questions are still answered "
+  "by the model itself (NOSEARCH), and multi-question utterances get one combined spoken "
+  "answer (synthesize_multi).")
+story.append(PageBreak())
+
+# =====================================================================================
+h1("14. Known limitations")
 # =====================================================================================
 b("Orin: the STT shares the GPU with the 80 ms step budget while the user speaks - use "
   "WEBSEARCH_STT_INT4=1; the feature is primarily tuned for the RunPod x86 path.")
@@ -501,7 +532,7 @@ b("Tavily's free tier is rate-limited; classification defaults to NOSEARCH on an
   "spurious searches are rare.")
 
 # =====================================================================================
-h1("14. How to use it")
+h1("15. How to use it")
 # =====================================================================================
 code(
     "# one time (RunPod notebook or shell)\n"

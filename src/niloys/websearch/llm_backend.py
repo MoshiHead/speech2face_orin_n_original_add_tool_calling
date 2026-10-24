@@ -49,6 +49,13 @@ ANSWER_SYSTEM = (
     "you could not find it."
 )
 
+ANSWER_MULTI_SYSTEM = (
+    "You answer several questions out loud, in order, using the web results provided where "
+    "they are relevant and your own knowledge for the rest. Answer every question, in the "
+    "order asked, in a few short natural spoken sentences (under {max_words} words total). "
+    "No lists, no markdown, no labels, no URLs, no filler."
+)
+
 
 class LocalLLM:
     def __init__(self, model_name: str, device: str = "cuda", log=print):
@@ -122,6 +129,33 @@ class LocalLLM:
             )
         except Exception as e:  # noqa: BLE001
             self.log(f"[LLM] answer synthesis failed ({e!r})")
+            return ""
+
+    def synthesize_multi(self, questions: list, results_map: dict, history_text: str = "", max_words: int = 80) -> str:
+        """Answer several questions in one spoken-style pass: web results for the
+        current-information ones, the model's own knowledge for the rest."""
+        q_lines = "\n".join(f"{i}) {q}" for i, q in enumerate(questions, 1))
+        blocks = []
+        for q, results in (results_map or {}).items():
+            for i, r in enumerate(results, 1):
+                blocks.append(f"[{q} -> {i}] {r.get('title', '')}\n{r.get('content', '')}")
+        user = ""
+        if history_text:
+            user += f"Conversation so far:\n{history_text}\n\n"
+        user += f"The user asked these {len(questions)} questions:\n{q_lines}\n\n"
+        if blocks:
+            user += "Web results for the current-information questions:\n" + "\n\n".join(blocks) + "\n\n"
+        user += "Answer every question in order, out loud."
+        try:
+            return self.generate(
+                [
+                    {"role": "system", "content": ANSWER_MULTI_SYSTEM.format(max_words=max_words)},
+                    {"role": "user", "content": user},
+                ],
+                max_new_tokens=220,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[LLM] multi-answer synthesis failed ({e!r})")
             return ""
 
 

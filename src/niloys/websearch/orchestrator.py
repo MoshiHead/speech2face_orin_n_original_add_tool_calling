@@ -164,12 +164,21 @@ class WebSearchOrchestrator:
                 return
             # at least one search is coming: keep PersonaPlex gated until the injection
             self.gate_search()
-            facts: list[tuple[str, str]] = []   # (sub_question, answer)
+            results_map: dict[str, list] = {}   # sub_question -> tavily results
             for sub_q, query in searches:
-                answer = await self._search_and_summarize(sub_q, query, history_text)
-                if answer:
-                    facts.append((sub_q, answer))
-            if not facts:
+                results = await self._search(query)
+                if results:
+                    results_map[sub_q] = results
+            if not results_map:
+                self.clear_search_gate()
+                return
+            # synthesize the exact text the model will speak
+            if len(questions) == 1:
+                sub_q = questions[0]
+                speak_text = await self._summarize(sub_q, results_map[sub_q], history_text)
+            else:
+                speak_text = await self._summarize_multi(questions, results_map, history_text)
+            if not speak_text:
                 self.clear_search_gate()
                 return
             late_ms = 1000.0 * (time.perf_counter() - turn_end_time)
@@ -178,12 +187,11 @@ class WebSearchOrchestrator:
                          f" (> {cfg.inject_deadline_ms} ms deadline) -- NOT injecting")
                 self.clear_search_gate()
                 return
-            inj = Injection(questions, facts, meta={
-                "budget": cfg.max_inject_tokens,
+            inj = Injection(speak_text, meta={
                 "pipeline_ms": 1000.0 * (time.perf_counter() - t0),
             })
             if cfg.dry_run:
-                self.log(f"[INJECT] DRY RUN -- would inject: {inj.text!r}")
+                self.log(f"[INJECT] DRY RUN -- would speak: {inj.text!r}")
             else:
                 self.log(f"[INJECT] queued: {inj.text!r}")
                 self._injections.put(inj)
@@ -221,7 +229,7 @@ class WebSearchOrchestrator:
                  f" ({1000.0 * (time.perf_counter() - t0):.0f} ms) q={question!r} raw={raw!r}")
         return needs, query
 
-    async def _search_and_summarize(self, question: str, query: str, history_text: str) -> str:
+    async def _search(self, query: str) -> list:
         cfg = self.cfg
         t1 = time.perf_counter()
         data = await asyncio.wait_for(
@@ -235,8 +243,10 @@ class WebSearchOrchestrator:
         for i, r in enumerate(results, 1):
             self.log(f"[SEARCH]   [{i}] {r.get('title', '')} ({r.get('url', '')})")
             self.log(f"[SEARCH]       {r.get('content', '')[:180]}")
-        if not results:
-            return ""
+        return results
+
+    async def _summarize(self, question: str, results: list, history_text: str) -> str:
+        cfg = self.cfg
         t2 = time.perf_counter()
         answer = await asyncio.wait_for(
             self._loop.run_in_executor(None, self.llm.synthesize, question, results,
@@ -247,11 +257,23 @@ class WebSearchOrchestrator:
             # one retry with a bare prompt (no history) before giving up
             answer = await asyncio.wait_for(
                 self._loop.run_in_executor(None, self.llm.synthesize, question, results,
-                                               "", cfg.max_answer_words),
+                                           "", cfg.max_answer_words),
                 timeout=cfg.llm_timeout_s,
             )
         self.log(f"[LLM-SUMMARY] ({1000.0 * (time.perf_counter() - t2):.0f} ms)"
                  f" answer: {answer!r}")
+        return answer or ""
+
+    async def _summarize_multi(self, questions: list, results_map: dict, history_text: str) -> str:
+        cfg = self.cfg
+        t2 = time.perf_counter()
+        answer = await asyncio.wait_for(
+            self._loop.run_in_executor(None, self.llm.synthesize_multi, questions,
+                                       results_map, history_text, cfg.max_answer_words * 2),
+            timeout=cfg.llm_timeout_s,
+        )
+        self.log(f"[LLM-SUMMARY] ({1000.0 * (time.perf_counter() - t2):.0f} ms)"
+                 f" multi-answer: {answer!r}")
         return answer or ""
 
     # ------------------------------------------------------- reply capture

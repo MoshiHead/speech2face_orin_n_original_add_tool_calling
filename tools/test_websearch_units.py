@@ -12,7 +12,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "src", "niloys"))
 
 from websearch.history import TurnHistory                      # noqa: E402
-from websearch.injector import Injection, build_injection_text  # noqa: E402
+from websearch.injector import Injection, build_speak_text     # noqa: E402
 from websearch.llm_backend import (parse_classification, is_stable_question, split_questions,  # noqa: E402
                                    keyword_suggests_search, needs_context)  # noqa: E402
 from websearch.tavily_client import format_results              # noqa: E402
@@ -72,34 +72,35 @@ check("history normalizes whitespace", h.turns[-1]["user"] == "spaced out")
 h.clear()
 check("history clear", len(h) == 0 and h.as_prompt_text() == "")
 
-# ---------------------------------------------------------------- injection text
-class FakeTok:
-    def encode(self, text):
-        return text.split()
+# ---------------------------------------------------------------- forced-speech injection
+check("speak text is the answer", build_speak_text("q?", "The price is $100.") == "The price is $100.")
+check("speak text normalizes whitespace", build_speak_text("q?", "  spaced   out  ") == "spaced out")
 
 
-t = build_injection_text("what is the bitcoin price?", "It is about $100,000 today.")
-check("injection wraps in system tags", t.startswith("<" + "|im_start|>system\n") and t.endswith("<" + "|im_end|>\n"))
-check("injection contains question and answer", "bitcoin price?" in t and "$100,000 today" in t)
+class FakeEngine:
+    def __init__(self):
+        self.queued = []
 
-inj = Injection("q?", " ".join(f"w{i}" for i in range(40)), meta={"budget": 60})
-tokens = inj.fit_token_budget(FakeTok(), 60)
-check("injection fits token budget", len(tokens) <= 60)
-check("injection keeps at least 6 answer words", len(inj.answer.split()) >= 6)
-check("injection records token count", inj.meta["tokens"] == len(tokens))
+    def queue_forced_speech(self, text):
+        self.queued.append(text)
+        return len(text.split())
 
-# single injection framing: the user is waiting + speak out loud (anti-greeting)
-st = build_injection_text("What is Bitcoin?", "Bitcoin is a decentralized digital currency.")
-check("injection says the user is waiting", "waiting" in st.lower())
-check("injection says answer out loud", "out loud" in st.lower())
 
-# ---------------------------------------------------------------- multi-question injection
-mt = build_injection_text(
-    ["What is Bitcoin?", "What is its price today?"],
-    [("What is its price today?", "It is about $100,000 today.")])
-check("multi injection lists all questions", "1) What is Bitcoin?" in mt and "2) What is its price today?" in mt)
-check("multi injection has the fact", "$100,000 today" in mt)
-check("multi injection wraps in system tags", mt.startswith("<" + "|im_start|>system\n"))
+inj = Injection("The current price of gold is $4,214.85 per ounce.")
+eng = FakeEngine()
+report = inj.run(eng, log=lambda m: None)
+check("injection queues the speak text", eng.queued == ["The current price of gold is $4,214.85 per ounce."])
+check("injection reports fed tokens", report["fed"] == 9 and report["total"] == 9 and not report["aborted"])
+check("injection text is the speak text", inj.text == "The current price of gold is $4,214.85 per ounce.")
+
+
+class BadEngine:
+    def queue_forced_speech(self, text):
+        raise RuntimeError("boom")
+
+
+report2 = Injection("some answer").run(BadEngine(), log=lambda m: None)
+check("injection survives engine failure", report2["fed"] == 0)
 
 # ---------------------------------------------------------------- stable-question guard
 check("stable: what is X", is_stable_question("What is Bitcoin?"))

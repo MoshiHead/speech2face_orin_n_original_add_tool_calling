@@ -43,6 +43,7 @@ _STAGE_ACC['n'] = 0
 import argparse
 import asyncio
 import base64
+import collections
 import concurrent.futures
 import contextlib
 import json
@@ -594,6 +595,82 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             events.append(self._step(pcm))
         return events
 
+    # ---------------------------------------------------------- forced speech
+    # The reliable way to deliver a web answer: make the model SAY it. Each answer token
+    # is forced as the agent-text token while the depformer generates the matching agent
+    # audio (moshi_tokens=None), so the model speaks exactly this text in its own voice.
+    # system-prompt tokens are used, so there is no session-start greeting to trigger.
+    def queue_forced_speech(self, text: str) -> int:
+        """Queue an answer to be SPOKEN by the model. Returns the number of tokens."""
+        if not hasattr(self, "forced_speech_tokens") or self.forced_speech_tokens is None:
+            self.forced_speech_tokens = collections.deque()
+        tokens = list(self.tokenizer.encode(str(text or "")))
+        self.forced_speech_tokens.extend(tokens)
+        return len(tokens)
+
+    @torch.no_grad()
+    def forced_speech_step(self) -> dict | None:
+        """Pop one queued answer token and speak it (forced agent-text, generated agent
+        audio), returning the same event dict a normal mic step produces. None when the
+        queue is empty."""
+        if not getattr(self, "forced_speech_tokens", None):
+            return None
+        text_tok = int(self.forced_speech_tokens.popleft())
+        return self._step_forced_text(text_tok)
+
+    @torch.no_grad()
+    def _step_forced_text(self, text_tok: int) -> dict:
+        self.step += 1
+        t0 = time.perf_counter()
+        sine = self.lm_gen._encode_sine_frame()   # [1, 8, 1] user-silent marker
+        lm_out = self.lm_gen._step(sine, text_token=text_tok)
+        tokens = None
+        helium_hidden = None
+        if lm_out is not None:
+            if not (isinstance(lm_out, tuple) and len(lm_out) == 3):
+                raise RuntimeError(f"Moshi graph layer[-2] contract failure: got {type(lm_out)}")
+            tokens, _transformer_out, layer_hidden = lm_out
+            helium_hidden = layer_hidden[:1, -1:].detach().float().cpu()
+        token = -1
+        token_piece = ""
+        reply_codes = None
+        if tokens is None:
+            reply_pcm = np.zeros(MIMI_FRAME_SIZE, dtype=np.float32)
+        else:
+            token = int(tokens[0, 0, 0].detach().item())
+            token_piece = self.decode_piece(token)
+            if token_piece:
+                self.audio_text += token_piece
+            reply_codes = tokens[:, 1:].detach().to(device="cpu", dtype=torch.int16)
+            reply = self.mimi.decode(tokens[:, 1:9])   # agent codebooks only
+            reply_pcm = reply[0, 0].detach().float().cpu().numpy()
+            if reply_pcm.shape[0] < MIMI_FRAME_SIZE:
+                reply_pcm = np.pad(reply_pcm, (0, MIMI_FRAME_SIZE - reply_pcm.shape[0]))
+            elif reply_pcm.shape[0] > MIMI_FRAME_SIZE:
+                reply_pcm = reply_pcm[:MIMI_FRAME_SIZE]
+        reply_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
+        reply_peak = float(np.max(np.abs(reply_pcm))) if reply_pcm.size else 0.0
+        total_ms = 1000.0 * (time.perf_counter() - t0)
+        reply_i16 = (np.clip(reply_pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
+        audio_b64 = base64.b64encode(reply_i16.tobytes()).decode("ascii")
+        return {
+            "step": int(self.step),
+            "sample_rate": TARGET_SR,
+            "reply_i16_b64": audio_b64,
+            "reply_rms": reply_rms,
+            "reply_peak": reply_peak,
+            "input_rms": 0.0,
+            "token": token,
+            "piece": token_piece,
+            "sampled_text": self.sampled_text,
+            "audio_text": self.audio_text,
+            "encode_ms": 0.0,
+            "lm_ms": total_ms,
+            "decode_ms": 0.0,
+            "total_ms": total_ms,
+            "helium_hidden": helium_hidden,
+            "reply_codes": reply_codes,
+        }
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -2946,16 +3023,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             else:
                                 with reply_input_lock:
                                     _inj.run(reply_engine, websearch.should_abort_injection, websearch.log)
-                            websearch.clear_search_gate()   # injection landed -> let the model answer
-                            # The injection held reply_input_lock for ~1-2 s, so mic audio
-                            # piled up in mic_q / input_buffer. Keep draining for a short
-                            # grace window (the blocked ingest thread needs a few ms to
-                            # flush its batch) so the model resumes on FRESH audio and no
-                            # catch-up burst reaches the GPU producer.
-                            drain_until = time.perf_counter() + 0.35
-                            while time.perf_counter() < drain_until:
-                                _drain_persona_input()
-                                time.sleep(0.005)
+                            websearch.clear_search_gate()   # answer queued -> let the model speak it
+                            # run() only enqueues the answer tokens now (no 1-2 s lock hold),
+                            # so there is no new mic backlog; forced speech drains as it speaks.
+                            _drain_persona_input()
                             continue
                         if websearch.search_gate_set():
                             # A web search is pending: pause PersonaPlex's input so the
@@ -2965,19 +3036,41 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             _drain_persona_input()
                             time.sleep(0.002)
                             continue
-                    if not session_started.is_set() or _persona_buffered_samples() < MIMI_FRAME_SIZE:
-                        time.sleep(0.002)
-                        continue
-                    buffered_before = _persona_buffered_samples()
-                    ready_before = buffered_before // MIMI_FRAME_SIZE
-                    if priority_stream is None:
-                        events = _persona_process_ready(1)
-                    else:
-                        with torch.cuda.stream(priority_stream):
+                    # Forced speech takes priority: the model speaks the injected answer
+                    # through the normal event path (forced agent-text, generated
+                    # agent-audio) -- no system-prompt reset, no session-start greeting.
+                    events = None
+                    ready_before = 0
+                    if session_started.is_set() and getattr(reply_engine, "forced_speech_tokens", None):
+                        if websearch is not None and websearch.should_abort_injection():
+                            with reply_input_lock:
+                                reply_engine.forced_speech_tokens.clear()   # barge-in
+                        else:
+                            _drain_persona_input()   # keep the buffer small while it speaks
+                            if priority_stream is not None:
+                                with torch.cuda.stream(priority_stream):
+                                    with reply_input_lock:
+                                        fs_event = reply_engine.forced_speech_step()
+                                priority_stream.synchronize()
+                            else:
+                                with reply_input_lock:
+                                    fs_event = reply_engine.forced_speech_step()
+                            if fs_event is not None:
+                                events = [fs_event]
+                    if events is None:
+                        if not session_started.is_set() or _persona_buffered_samples() < MIMI_FRAME_SIZE:
+                            time.sleep(0.002)
+                            continue
+                        buffered_before = _persona_buffered_samples()
+                        ready_before = buffered_before // MIMI_FRAME_SIZE
+                        if priority_stream is None:
                             events = _persona_process_ready(1)
-                        # Hidden/audio copies produced by _step synchronize the
-                        # generated event before it is published to IMTalker.
-                        priority_stream.synchronize()
+                        else:
+                            with torch.cuda.stream(priority_stream):
+                                events = _persona_process_ready(1)
+                            # Hidden/audio copies produced by _step synchronize the
+                            # generated event before it is published to IMTalker.
+                            priority_stream.synchronize()
                     for event in events:
                         if websearch is not None:
                             websearch.observe_reply_rms(float(event.get("reply_rms", 0.0)))
